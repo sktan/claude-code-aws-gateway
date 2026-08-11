@@ -942,3 +942,57 @@ async fn updated_at_bumps_on_upsert() {
         .await
         .expect("cleanup must succeed");
 }
+
+// ============================================================
+// 12. estimate_cost_usd: Bedrock inference profile prefix stripped
+// ============================================================
+
+/// estimate_cost_usd must resolve Bedrock inference profile IDs like
+/// "au.anthropic.claude-opus-4-7" to the same row as the bare ID
+/// "claude-opus-4-7".  The "<region>.<vendor>." prefix is stripped before
+/// the LIKE match (migration 013).
+#[tokio::test]
+async fn estimate_cost_strips_inference_profile_prefix() {
+    let pool = helpers::setup_test_db().await;
+
+    // All three regional prefixes should resolve correctly.
+    for prefix in &["au", "us", "eu"] {
+        let model = format!("{prefix}.anthropic.claude-opus-4-7");
+        let cost: Option<f64> =
+            sqlx::query_scalar("SELECT estimate_cost_usd($1, 1000000, 0, 0, 0)")
+                .bind(&model)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("estimate_cost_usd failed for '{model}': {e}"));
+
+        let cost = cost.unwrap_or_else(|| {
+            panic!("'{model}' should match claude-opus-4-7 but returned NULL")
+        });
+        assert!(
+            (cost - 5.0).abs() < 1e-6,
+            "'{model}' should cost $5.00 (claude-opus-4-7 input rate), got ${cost:.6}"
+        );
+    }
+}
+
+/// A date-suffixed inference profile ID like "us.anthropic.claude-opus-4-7-20260401"
+/// must also resolve correctly after stripping the regional prefix.
+#[tokio::test]
+async fn estimate_cost_strips_inference_profile_prefix_with_date_suffix() {
+    let pool = helpers::setup_test_db().await;
+
+    let cost: Option<f64> = sqlx::query_scalar(
+        "SELECT estimate_cost_usd('us.anthropic.claude-opus-4-7-20260401', 1000000, 0, 0, 0)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("estimate_cost_usd query failed");
+
+    let cost = cost.expect(
+        "'us.anthropic.claude-opus-4-7-20260401' should match claude-opus-4-7 but returned NULL",
+    );
+    assert!(
+        (cost - 5.0).abs() < 1e-6,
+        "Expected $5.00, got ${cost:.6}"
+    );
+}
