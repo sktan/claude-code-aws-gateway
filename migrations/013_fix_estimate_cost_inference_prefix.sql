@@ -29,7 +29,10 @@ BEGIN
     -- Strip optional "<region>.<vendor>." prefix from Bedrock inference profile
     -- IDs (e.g. "au.anthropic." or "us.anthropic.") so that they resolve to
     -- the same model_prefix rows as bare IDs like "claude-opus-5".
-    clean_model := regexp_replace(p_model, '^[a-z0-9]+\.[a-z]+\.', '');
+    -- The pattern is anchored to the known AWS Bedrock regional prefixes
+    -- (au, us, eu) to avoid accidentally stripping bare model IDs.
+    -- Add new region codes here if AWS expands the inference profile regions.
+    clean_model := regexp_replace(p_model, '^(au|us|eu)\.[a-z]+\.', '');
 
     SELECT input_rate, output_rate, cache_read_rate, cache_write_rate
     INTO r FROM model_pricing
