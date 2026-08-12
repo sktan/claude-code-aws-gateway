@@ -965,9 +965,8 @@ async fn estimate_cost_strips_inference_profile_prefix() {
                 .await
                 .unwrap_or_else(|e| panic!("estimate_cost_usd failed for '{model}': {e}"));
 
-        let cost = cost.unwrap_or_else(|| {
-            panic!("'{model}' should match claude-opus-4-7 but returned NULL")
-        });
+        let cost = cost
+            .unwrap_or_else(|| panic!("'{model}' should match claude-opus-4-7 but returned NULL"));
         assert!(
             (cost - 5.0).abs() < 1e-6,
             "'{model}' should cost $5.00 (claude-opus-4-7 input rate), got ${cost:.6}"
@@ -991,8 +990,5 @@ async fn estimate_cost_strips_inference_profile_prefix_with_date_suffix() {
     let cost = cost.expect(
         "'us.anthropic.claude-opus-4-7-20260401' should match claude-opus-4-7 but returned NULL",
     );
-    assert!(
-        (cost - 5.0).abs() < 1e-6,
-        "Expected $5.00, got ${cost:.6}"
-    );
+    assert!((cost - 5.0).abs() < 1e-6, "Expected $5.00, got ${cost:.6}");
 }
