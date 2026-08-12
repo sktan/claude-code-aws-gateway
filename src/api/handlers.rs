@@ -729,7 +729,7 @@ pub async fn messages(
             && let Some((prefix, suffix, display, profile_prefix)) =
                 models::discover_model(control_client, &bedrock_model, &routing_prefix).await
         {
-            bedrock_model = format!("{}.{}", profile_prefix, &suffix);
+            bedrock_model = format!("{}.{}", profile_prefix, suffix);
             let mapping = models::CachedMapping {
                 anthropic_prefix: prefix.clone(),
                 bedrock_suffix: suffix.clone(),
