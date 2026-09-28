@@ -102,8 +102,14 @@ fn model_display_name(anthropic_id: &str) -> String {
         s if s.starts_with("claude-sonnet-4-20") => "Claude Sonnet 4".to_string(),
         s if s.starts_with("claude-haiku-4-5") => "Claude Haiku 4.5".to_string(),
         other => {
-            // Strip date suffix and title-case the remaining parts.
-            // e.g. "claude-future-5-0-20260601" -> "Claude Future 5 0"
+            // Strip [\w+] variant suffix (e.g. [1m], [2m]) before any other logic.
+            static SUFFIX_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+            let re = SUFFIX_RE.get_or_init(|| regex::Regex::new(r"\[\w+\]$").unwrap());
+            let no_bracket = re.replace(other, "");
+            let other: &str = &no_bracket;
+
+            // Strip date suffix and version/colon suffixes.
+            // e.g. "claude-future-5-1-20260601" -> "claude-future-5-1"
             let base = crate::translate::models::strip_date_suffix(other);
             // Remove ":0" or "-v1:0" style suffixes
             let base = base.trim_end_matches(":0");
@@ -112,7 +118,47 @@ fn model_display_name(anthropic_id: &str) -> String {
             } else {
                 base
             };
-            base.split('-')
+
+            // Generic decimal rendering: when the last two dash-segments are both
+            // all-numeric (e.g. "5" and "1" in "claude-fable-5-1"), join them with
+            // "." to produce "5.1" rather than "5 1". A single trailing numeric
+            // segment (e.g. "claude-fable-5") gets no decimal — there is no second
+            // numeric segment to pair with.
+            let parts: Vec<&str> = base.split('-').collect();
+            if parts.len() >= 2 {
+                let last = *parts.last().unwrap();
+                let second_last = parts[parts.len() - 2];
+                if !last.is_empty()
+                    && last.bytes().all(|b| b.is_ascii_digit())
+                    && !second_last.is_empty()
+                    && second_last.bytes().all(|b| b.is_ascii_digit())
+                {
+                    // Render prefix parts as title-cased words, then append "Major.Minor"
+                    let prefix_parts = &parts[..parts.len() - 2];
+                    let mut result = prefix_parts
+                        .iter()
+                        .map(|p| {
+                            let mut c = p.chars();
+                            match c.next() {
+                                None => String::new(),
+                                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if !result.is_empty() {
+                        result.push(' ');
+                    }
+                    result.push_str(second_last);
+                    result.push('.');
+                    result.push_str(last);
+                    return result;
+                }
+            }
+
+            // Fallback: title-case each segment joined with spaces.
+            parts
+                .iter()
                 .map(|part| {
                     let mut c = part.chars();
                     match c.next() {
@@ -1136,7 +1182,17 @@ fn extract_request_info(req: &request::AnthropicRequest) -> RequestInfo {
                             let error_snippet = block
                                 .get("content")
                                 .and_then(|c| c.as_str())
-                                .map(|s| if s.len() > 100 { &s[..100] } else { s })
+                                .map(|s| {
+                                    if s.len() > 100 {
+                                        let mut idx = 100;
+                                        while idx > 0 && !s.is_char_boundary(idx) {
+                                            idx -= 1;
+                                        }
+                                        &s[..idx]
+                                    } else {
+                                        s
+                                    }
+                                })
                                 .unwrap_or("unknown");
                             tool_errors.push(json!({
                                 "tool_use_id": tool_use_id,
@@ -4839,5 +4895,552 @@ mod tests_dispatch_precedence {
                 c.label
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_extract_request_info_utf8 {
+    use super::*;
+    use serde_json::json;
+
+    /// Covers the `else { s }` branch (~handlers.rs:1146): when the tool_result
+    /// error content is well under 100 bytes it must be returned unchanged.
+    #[test]
+    fn test_tool_result_error_short_content_returned_unchanged() {
+        let content = "boom";
+        assert!(
+            content.len() <= 100,
+            "precondition: content must be short (<=100 bytes)"
+        );
+
+        let req = request::AnthropicRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: None,
+            messages: vec![
+                // assistant message with tool_use so there is a valid tool_use_id
+                json!({
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_002",
+                        "name": "bash",
+                        "input": {}
+                    }]
+                }),
+                // user message with short tool_result error (well under 100 bytes)
+                json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_002",
+                        "is_error": true,
+                        "content": content
+                    }]
+                }),
+            ],
+            system: None,
+            stream: None,
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            mcp_servers: None,
+            anthropic_beta: vec![],
+        };
+
+        let info = extract_request_info(&req);
+
+        let errors = info.tool_errors.expect("tool_errors must be Some");
+        let snippet = errors[0]["error"]
+            .as_str()
+            .expect("error field must be a string");
+
+        assert_eq!(
+            snippet, content,
+            "short content must be returned unchanged, not truncated"
+        );
+    }
+
+    /// Regression test for the byte-slice panic in `extract_request_info`.
+    ///
+    /// Line ~1139: `&s[..100]` slices at byte index 100 without checking char
+    /// boundaries. When a multi-byte UTF-8 character (e.g. '╭', 3 bytes:
+    /// 0xe2 0x94 0xad) straddles byte 100, Rust panics:
+    ///   "byte index 100 is not a char boundary".
+    ///
+    /// This test is intentionally RED until the production code is fixed.
+    #[test]
+    fn test_tool_result_error_multibyte_char_at_byte_100_no_panic() {
+        // '╭' (U+256D) encodes as 3 bytes: 0xe2 0x94 0xad.
+        // 99 ASCII 'a' chars + '╭...' places the start of '╭' at byte index 99,
+        // so bytes 99/100/101 belong to that single character.
+        // `&s[..100]` then slices through the middle of '╭' → panic.
+        let content = "a".repeat(99) + "╭─ Error ─────────────────";
+        assert!(
+            content.len() > 100,
+            "precondition: content must exceed 100 bytes"
+        );
+        assert!(
+            !content.is_char_boundary(100),
+            "precondition: byte 100 must NOT be a char boundary"
+        );
+
+        let req = request::AnthropicRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: None,
+            messages: vec![
+                // assistant message with tool_use so there is a valid tool_use_id
+                json!({
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_001",
+                        "name": "bash",
+                        "input": {}
+                    }]
+                }),
+                // user message with tool_result error; content straddles byte 100
+                json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_001",
+                        "is_error": true,
+                        "content": content
+                    }]
+                }),
+            ],
+            system: None,
+            stream: None,
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            mcp_servers: None,
+            anthropic_beta: vec![],
+        };
+
+        // Currently panics at &s[..100] because byte 100 is not a char boundary.
+        // After the fix this must complete without panicking.
+        let info = extract_request_info(&req);
+
+        let errors = info.tool_errors.expect("tool_errors must be Some");
+        let snippet = errors[0]["error"]
+            .as_str()
+            .expect("error field must be a string");
+
+        assert!(
+            snippet.len() <= 100,
+            "truncated snippet must be at most 100 bytes, got {}",
+            snippet.len()
+        );
+        assert!(
+            std::str::from_utf8(snippet.as_bytes()).is_ok(),
+            "truncated snippet must be valid UTF-8"
+        );
+    }
+}
+
+// ── Reverse-map display-name tests (Section D + E) ────────────────────────────
+//
+// Section D: `model_display_name` must use decimal notation for minor-version
+//   segments so that `claude-fable-5-1` renders as "Claude Fable 5.1" and
+//   `claude-opus-4-8` renders as "Claude Opus 4.8" (today both render with a
+//   space: "Claude Fable 5 1", "Claude Opus 4 8").
+//
+// Section E: `build_models_response_with_variants` must advertise both
+//   `claude-fable-5` and `claude-fable-5-1` as distinct entries (the HashSet
+//   currently collapses them because the hardcoded reverse map returns the same
+//   Anthropic id for both).
+#[cfg(test)]
+mod tests_reverse_map_display {
+    use super::*;
+
+    // ── Section D: model_display_name decimal rendering ───────────────────────
+
+    /// [FAIL] `claude-fable-5-1` must render as "Claude Fable 5.1".
+    ///
+    /// The generic fallback title-cases each dash-segment, so today it produces
+    /// "Claude Fable 5 1". The fix must detect a trailing single-digit segment
+    /// (the minor version number) and join it to the preceding segment with `.`
+    /// rather than ` `.
+    #[test]
+    fn test_display_name_fable_5_1_decimal() {
+        assert_eq!(
+            model_display_name("claude-fable-5-1"),
+            "Claude Fable 5.1",
+            "'claude-fable-5-1' must render as 'Claude Fable 5.1', not 'Claude Fable 5 1'"
+        );
+    }
+
+    /// [FAIL] `claude-opus-4-8` must render as "Claude Opus 4.8".
+    ///
+    /// There is no explicit arm for opus-4-8, so it falls to the generic path.
+    /// Today: "Claude Opus 4 8". After fix: "Claude Opus 4.8".
+    #[test]
+    fn test_display_name_opus_4_8_decimal() {
+        assert_eq!(
+            model_display_name("claude-opus-4-8"),
+            "Claude Opus 4.8",
+            "'claude-opus-4-8' must render as 'Claude Opus 4.8', not 'Claude Opus 4 8'"
+        );
+    }
+
+    /// [FAIL] The `[1m]` variant suffix must be stripped before rendering.
+    ///
+    /// `model_display_name("claude-fable-5-1[1m]")` must return "Claude Fable 5.1".
+    /// Currently the function does not strip bracket suffixes, so the brackets
+    /// appear in the title-cased output.
+    #[test]
+    fn test_display_name_fable_5_1_with_1m_suffix_stripped() {
+        assert_eq!(
+            model_display_name("claude-fable-5-1[1m]"),
+            "Claude Fable 5.1",
+            "'claude-fable-5-1[1m]' must strip the [1m] suffix and render as 'Claude Fable 5.1'"
+        );
+    }
+
+    /// [PASS-REGRESSION] Existing explicit arms must still return their canonical names.
+    #[test]
+    fn test_display_name_existing_explicit_arms_regression() {
+        assert_eq!(
+            model_display_name("claude-opus-4-7"),
+            "Claude Opus 4.7",
+            "regression: claude-opus-4-7"
+        );
+        assert_eq!(
+            model_display_name("claude-opus-4-6-20250605"),
+            "Claude Opus 4.6",
+            "regression: claude-opus-4-6-20250605"
+        );
+        assert_eq!(
+            model_display_name("claude-sonnet-4-6-20250514"),
+            "Claude Sonnet 4.6",
+            "regression: claude-sonnet-4-6-20250514"
+        );
+        assert_eq!(
+            model_display_name("claude-haiku-4-5-20251001"),
+            "Claude Haiku 4.5",
+            "regression: claude-haiku-4-5-20251001"
+        );
+        assert_eq!(
+            model_display_name("claude-sonnet-4-20250514"),
+            "Claude Sonnet 4",
+            "regression: claude-sonnet-4-20250514 (bare major, no minor segment)"
+        );
+    }
+
+    /// [PASS-REGRESSION] `claude-fable-5` (major only, no minor) must render as
+    /// "Claude Fable 5" — the decimal path must NOT fire for a bare major version.
+    #[test]
+    fn test_display_name_fable_5_no_decimal() {
+        assert_eq!(
+            model_display_name("claude-fable-5"),
+            "Claude Fable 5",
+            "'claude-fable-5' must render as 'Claude Fable 5', not 'Claude Fable 5.' or similar"
+        );
+    }
+
+    /// [PASS-REGRESSION] Non-Claude/unknown ids keep the existing title-case fallback.
+    ///
+    /// Locks in the current output for an unknown id so the builder cannot silently
+    /// regress the fallback path while adding the decimal-rendering logic.
+    #[test]
+    fn test_display_name_unknown_id_title_case_fallback() {
+        // "amazon-nova-2" has no explicit arm; it title-cases each segment.
+        // "2" is a single digit, but it is the ONLY numeric segment so there is no
+        // preceding numeric segment to form a decimal pair — it should still render
+        // with a space, not collapse oddly.
+        let result = model_display_name("amazon-nova-2");
+        // The result is "Amazon Nova 2" — lock it in so any regression is caught.
+        assert_eq!(
+            result, "Amazon Nova 2",
+            "non-Claude unknown id must title-case as-is; regression check"
+        );
+    }
+
+    // ── Section E: build_models_response_with_variants — no HashSet collapse ──
+
+    /// [FAIL] Both `claude-fable-5` and `claude-fable-5-1` must appear as distinct
+    /// entries in the `/v1/models` response.
+    ///
+    /// Today: `bedrock_to_anthropic("global.anthropic.claude-fable-5-1", None)` returns
+    /// `"claude-fable-5"` (greedy contains), so both profile IDs collapse into the same
+    /// Anthropic id and the HashSet deduplicates down to one entry.
+    ///
+    /// After the fix: reverse mapping is boundary-aware, both ids are distinct,
+    /// and the response contains two separate entries with correct display names.
+    #[test]
+    fn test_fable_5_and_fable_5_1_not_collapsed_in_models_response() {
+        // Provide both Bedrock profile IDs as they appear in Bedrock's
+        // ListInferenceProfiles output, already mapped to their Anthropic ids.
+        let pairs: Vec<(String, String)> = vec![
+            (
+                "claude-fable-5".to_string(),
+                "global.anthropic.claude-fable-5".to_string(),
+            ),
+            (
+                "claude-fable-5-1".to_string(),
+                "global.anthropic.claude-fable-5-1".to_string(),
+            ),
+        ];
+        // No suffix variants needed for this test.
+        let suffix_map: &[(&str, &str, &str)] = &[];
+        let json = build_models_response_with_variants(&pairs, |_profile, _beta| None, suffix_map);
+
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+
+        assert!(
+            ids.contains(&"claude-fable-5"),
+            "'claude-fable-5' must be present in /v1/models response; got: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"claude-fable-5-1"),
+            "'claude-fable-5-1' must be present in /v1/models response; \
+             currently collapsed into 'claude-fable-5' by greedy reverse map; got: {ids:?}"
+        );
+        assert_eq!(
+            ids.len(),
+            2,
+            "response must contain exactly 2 distinct entries (fable-5 and fable-5-1), \
+             not 1 (collapsed) or more; got: {ids:?}"
+        );
+
+        // Verify display names are correct
+        let fable5_entry = data
+            .iter()
+            .find(|m| m["id"].as_str() == Some("claude-fable-5"))
+            .expect("claude-fable-5 entry must exist");
+        assert_eq!(
+            fable5_entry["display_name"].as_str(),
+            Some("Claude Fable 5"),
+            "'claude-fable-5' display_name must be 'Claude Fable 5'"
+        );
+
+        let fable51_entry = data
+            .iter()
+            .find(|m| m["id"].as_str() == Some("claude-fable-5-1"))
+            .expect("claude-fable-5-1 entry must exist");
+        assert_eq!(
+            fable51_entry["display_name"].as_str(),
+            Some("Claude Fable 5.1"),
+            "'claude-fable-5-1' display_name must be 'Claude Fable 5.1'"
+        );
+    }
+
+    /// [FAIL] Full production flow: raw Bedrock profile IDs must yield two distinct
+    /// Anthropic ids after `bedrock_to_anthropic` reverse-mapping.
+    ///
+    /// In production, `list_models` calls `bedrock_to_anthropic` on each Bedrock
+    /// profile ID to build the `pairs` slice for `build_models_response_with_variants`.
+    /// When Bug A is present, both `global.anthropic.claude-fable-5` and
+    /// `global.anthropic.claude-fable-5-1` map to `"claude-fable-5"`, producing
+    /// duplicate pairs that the HashSet collapses to a single entry.
+    ///
+    /// After the fix, the reverse mapping is boundary-aware and both profile IDs
+    /// map to distinct Anthropic ids.
+    #[test]
+    fn test_fable_5_1_not_collapsed_via_reverse_map_full_flow() {
+        // Simulate what list_models does: map raw Bedrock IDs to Anthropic ids.
+        let bedrock_profile_ids = [
+            "global.anthropic.claude-fable-5".to_string(),
+            "global.anthropic.claude-fable-5-1".to_string(),
+        ];
+        let pairs: Vec<(String, String)> = bedrock_profile_ids
+            .iter()
+            .map(|bedrock_id| {
+                let anthropic_id = models::bedrock_to_anthropic(bedrock_id, None);
+                (anthropic_id, bedrock_id.clone())
+            })
+            .collect();
+
+        // After Bug A is fixed, this must produce two DISTINCT Anthropic ids.
+        let anthropic_ids: Vec<&str> = pairs.iter().map(|(a, _)| a.as_str()).collect();
+        assert!(
+            anthropic_ids.contains(&"claude-fable-5"),
+            "reverse-map must yield 'claude-fable-5' for 'global.anthropic.claude-fable-5'; \
+             got: {anthropic_ids:?}"
+        );
+        assert!(
+            anthropic_ids.contains(&"claude-fable-5-1"),
+            "reverse-map must yield 'claude-fable-5-1' for 'global.anthropic.claude-fable-5-1'; \
+             today it returns 'claude-fable-5' (greedy contains bug); got: {anthropic_ids:?}"
+        );
+
+        // Build the models response and assert both entries appear.
+        let suffix_map: &[(&str, &str, &str)] = &[];
+        let json = build_models_response_with_variants(&pairs, |_profile, _beta| None, suffix_map);
+        let data = json["data"].as_array().expect("'data' array expected");
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+
+        assert_eq!(
+            ids.len(),
+            2,
+            "after reverse-map fix, response must have 2 entries (fable-5 and fable-5-1); \
+             currently collapses to 1 via greedy reverse-map; got: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"claude-fable-5-1"),
+            "'claude-fable-5-1' must appear in the final response; got: {ids:?}"
+        );
+    }
+}
+
+// ── Section E: end-to-end advertising with junk cache rows present ────────────
+//
+// These tests wire up the exact prod junk-row cache state into the full
+// `bedrock_to_anthropic` → `build_models_response_with_variants` pipeline and
+// assert that the advertised list reflects canonical ids derived from
+// `bedrock_suffix`, not the junk `anthropic_prefix` aliases.
+//
+// Complements `tests_canonical_id_derivation` (in src/translate/models.rs) which
+// covers the `ModelCache::lookup_reverse` unit contract in isolation.
+#[cfg(test)]
+mod tests_canonical_id_advertising {
+    use super::*;
+
+    /// [FAIL] With the prod junk cache rows, `bedrock_to_anthropic` must yield the
+    /// correct canonical ids rather than the junk `anthropic_prefix` aliases.
+    ///
+    /// Pre-fix: `"global.anthropic.claude-fable-5"` maps to `"fable-5"` or
+    /// `"claude-fable"` depending on HashMap iteration order.
+    /// Post-fix: both must derive `"claude-fable-5"` from the `bedrock_suffix`.
+    #[tokio::test]
+    async fn test_junk_cache_yields_canonical_ids() {
+        let cache = models::ModelCache::new();
+        cache
+            .insert(models::CachedMapping {
+                anthropic_prefix: "claude-fable".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        cache
+            .insert(models::CachedMapping {
+                anthropic_prefix: "fable-5".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        cache
+            .insert(models::CachedMapping {
+                anthropic_prefix: "claude-fable-5-1".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5-1".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+
+        let id_5 = models::bedrock_to_anthropic("global.anthropic.claude-fable-5", Some(&cache));
+        assert_eq!(
+            id_5, "claude-fable-5",
+            "junk cache: bedrock_to_anthropic must return 'claude-fable-5', not a junk \
+             alias; got: {id_5}"
+        );
+
+        let id_5_1 =
+            models::bedrock_to_anthropic("global.anthropic.claude-fable-5-1", Some(&cache));
+        assert_eq!(
+            id_5_1, "claude-fable-5-1",
+            "junk cache: bedrock_to_anthropic must return 'claude-fable-5-1'; got: {id_5_1}"
+        );
+    }
+
+    /// [FAIL] End-to-end: prod junk cache state → `build_models_response_with_variants`
+    /// must advertise `"claude-fable-5"` (display "Claude Fable 5") and
+    /// `"claude-fable-5-1"` (display "Claude Fable 5.1"), and must NOT advertise
+    /// `"fable-5"` or `"claude-fable"`.
+    #[tokio::test]
+    async fn test_junk_cache_models_response_canonical() {
+        let cache = models::ModelCache::new();
+        cache
+            .insert(models::CachedMapping {
+                anthropic_prefix: "claude-fable".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        cache
+            .insert(models::CachedMapping {
+                anthropic_prefix: "fable-5".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+        cache
+            .insert(models::CachedMapping {
+                anthropic_prefix: "claude-fable-5-1".to_string(),
+                bedrock_suffix: "anthropic.claude-fable-5-1".to_string(),
+                anthropic_display: None,
+            })
+            .await;
+
+        // Simulate the list_models pipeline: map raw Bedrock IDs to Anthropic ids.
+        let bedrock_ids = [
+            "global.anthropic.claude-fable-5".to_string(),
+            "global.anthropic.claude-fable-5-1".to_string(),
+        ];
+        let pairs: Vec<(String, String)> = bedrock_ids
+            .iter()
+            .map(|bedrock_id| {
+                let anthropic_id = models::bedrock_to_anthropic(bedrock_id, Some(&cache));
+                (anthropic_id, bedrock_id.clone())
+            })
+            .collect();
+
+        let suffix_map: &[(&str, &str, &str)] = &[];
+        let json = build_models_response_with_variants(&pairs, |_profile, _beta| None, suffix_map);
+        let data = json["data"]
+            .as_array()
+            .expect("response must have 'data' array");
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+
+        assert!(
+            ids.contains(&"claude-fable-5"),
+            "'claude-fable-5' must be advertised; got: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"claude-fable-5-1"),
+            "'claude-fable-5-1' must be advertised; got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"fable-5"),
+            "junk alias 'fable-5' must NOT be advertised; got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"claude-fable"),
+            "junk alias 'claude-fable' must NOT be advertised; got: {ids:?}"
+        );
+
+        // Display names must match canonical rendering.
+        let fable5 = data
+            .iter()
+            .find(|m| m["id"].as_str() == Some("claude-fable-5"))
+            .expect("claude-fable-5 entry must exist");
+        assert_eq!(
+            fable5["display_name"].as_str(),
+            Some("Claude Fable 5"),
+            "'claude-fable-5' display_name must be 'Claude Fable 5'"
+        );
+
+        let fable51 = data
+            .iter()
+            .find(|m| m["id"].as_str() == Some("claude-fable-5-1"))
+            .expect("claude-fable-5-1 entry must exist");
+        assert_eq!(
+            fable51["display_name"].as_str(),
+            Some("Claude Fable 5.1"),
+            "'claude-fable-5-1' display_name must be 'Claude Fable 5.1'"
+        );
     }
 }
