@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.7] - 2026-09-30
+
+### Fixed
+
+- Fixed the model-id aliasing regression introduced in the 1.9.6 hotfix: inference-profile selection now enforces exact-match and boundary-aware matching instead of greedy prefix matching, preventing dated/versioned Claude IDs from shadowing peers like `claude-opus-4` and `claude-fable-5`.
+- Fixed reverse model resolution when `anthropic_display` is `NULL` by deriving a canonical Anthropic ID from the Bedrock suffix, so `/v1/models` and response payloads stay stable even when alias rows were created during discovery.
+- Fixed discovery caching to preserve the exact requested Anthropic ID in `anthropic_prefix` while still selecting the correct Bedrock profile; versioned and date-stamped IDs continue to resolve without mutating the user-facing model name.
+
+### Changed
+
+- Hardened model cache behavior across both forward and reverse lookups: exact-match first, then single-step date stripping only for minor-version-bearing IDs, followed by boundary-aware matching to avoid false positives from short stems.
+- Updated model discovery to prefer exact stem, then versioned stem, then fuzzy contains when selecting a Bedrock inference profile, reducing misroutes across model families and variants.
+
 ## [1.7.0] - 2026-06-03
 
 ### Fixed
